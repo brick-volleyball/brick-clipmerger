@@ -621,8 +621,13 @@ If you want to offset all timestamps of a track such that the first one is zero,
 
   function mapAudioCodecFamily(codecStr) {
     if (!codecStr) return null;
-    if (/^mp4a/.test(codecStr)) return 'aac';
-    if (/^opus/.test(codecStr)) return 'opus';
+    // MP4Box reports the Opus sample entry's codec string as "Opus" (capitalized) rather
+    // than the lowercase "opus" used elsewhere (e.g. WebCodecs' own codec strings) - a
+    // case-sensitive match here silently failed for every Opus clip, which alone forced
+    // ALL Opus-audio clips onto the slow re-encode fallback path even when they matched
+    // exactly, same as the vp9-description issue above.
+    if (/^mp4a/i.test(codecStr)) return 'aac';
+    if (/^opus/i.test(codecStr)) return 'opus';
     return null;
   }
 
@@ -634,6 +639,14 @@ If you want to offset all timestamps of a track such that the first one is zero,
     if (hasVideo) {
       const vf = mapVideoCodecFamily(first.video.codec);
       if (!vf) return false;
+      // NOTE: vp9/av1 are intentionally excluded from the fast (raw-copy) path here.
+      // mp4-muxer requires a `colorSpace` in the decoder config to build a VP9 vpcC box
+      // (it throws otherwise) and this app doesn't currently extract that from the source
+      // file, so vp9/av1 clips always go through the re-encode fallback path, which is
+      // correct and produces a valid (if slightly re-encoded) result. Only avc/hevc, which
+      // carry the needed out-of-band description (SPS/PPS) via getVideoDescriptionBytes(),
+      // are eligible for the lossless fast path.
+      if (vf !== 'avc' && vf !== 'hevc') return false;
       for (let i = 0; i < probes.length; i++) {
         const p = probes[i];
         if (!p.video) return false;
@@ -650,15 +663,28 @@ If you want to offset all timestamps of a track such that the first one is zero,
     const noneHaveAudio = probes.every(function (p) { return !p.audio; });
     if (!allHaveAudio && !noneHaveAudio) return false;
 
+    // Raw-copying MULTIPLE clips' worth of ENCODED audio back-to-back (as this fast path
+    // does for video) is not valid the way it is for video. Video clips are safe to splice
+    // at the raw bitstream level because each clip starts with a keyframe, which resets the
+    // decoder's prediction state - a declared timestamp jump between clips is a legitimate,
+    // well-supported way to represent a gap. Predictive audio codecs (AAC/Opus) have no such
+    // per-clip reset: each clip's audio was encoded by its OWN independent encoder session,
+    // but a decoder fed the concatenated bitstream treats it as ONE continuous session and
+    // just decodes samples back-to-back with no way to honor a declared PTS gap or to know
+    // where one clip's encoder state should end and the next's should begin. In testing this
+    // produced audio that: (a) ignored the intended per-clip timing entirely (decoded length
+    // = sum of the clips' own raw audio durations, drifting further from the video timeline
+    // with every clip - the same symptom reported by the user), and (b) carries each clip's
+    // own encoder priming delay as extra audible content instead of being trimmed. None of
+    // this is fixable without actually re-encoding the audio, which is exactly what the
+    // fallback path already does correctly (including real silence for any video/audio
+    // length gap - see runReencodeConcat). So: multi-clip merges with audio always take the
+    // fallback path; only a single clip (no splice point exists) or fully silent clips are
+    // eligible for the raw-copy fast path.
     if (allHaveAudio) {
+      if (probes.length > 1) return false;
       const af = mapAudioCodecFamily(first.audio.codec);
       if (!af) return false;
-      for (let i = 0; i < probes.length; i++) {
-        const p = probes[i];
-        if (mapAudioCodecFamily(p.audio.codec) !== af) return false;
-        if (p.audio.sampleRate !== first.audio.sampleRate) return false;
-        if (p.audio.channelCount !== first.audio.channelCount) return false;
-      }
     }
     return true;
   }
@@ -711,9 +737,6 @@ If you want to offset all timestamps of a track such that the first one is zero,
           muxer.addVideoChunkRaw(s.data, s.is_sync ? 'key' : 'delta', ptsUs, durationUs, meta, ctoUs);
           videoMetaSent = true;
         }
-        const lastV = p.videoSamples[p.videoSamples.length - 1];
-        const clipVideoDurUs = lastV ? Math.round(((lastV.dts + lastV.duration) / ts) * 1e6) : 0;
-        videoOffsetUs += clipVideoDurUs;
       }
 
       if (hasAudio && p.audio) {
@@ -728,10 +751,19 @@ If you want to offset all timestamps of a track such that the first one is zero,
           muxer.addAudioChunkRaw(s.data, s.is_sync ? 'key' : 'delta', ptsUs, durationUs, meta, ctoUs);
           audioMetaSent = true;
         }
-        const lastA = p.audioSamples[p.audioSamples.length - 1];
-        const clipAudioDurUs = lastA ? Math.round(((lastA.dts + lastA.duration) / ts) * 1e6) : 0;
-        audioOffsetUs += clipAudioDurUs;
       }
+
+      // Advance BOTH tracks' offsets by the SAME per-clip amount (the clip's overall
+      // duration, i.e. max(video track duration, audio track duration) - already computed
+      // by probeFile as p.durationSec). Advancing each track by its OWN measured duration
+      // independently (as this used to do) causes the two timelines to drift apart clip
+      // after clip whenever a clip's video and audio track lengths differ even slightly
+      // (extremely common - encoders routinely pad/trim a few ms differently per track),
+      // and the error compounds with every additional clip, producing exactly the
+      // "audio gradually drifts out of sync" symptom reported after real-world testing.
+      const clipAdvanceUs = Math.round((p.durationSec || 0) * 1e6);
+      videoOffsetUs += clipAdvanceUs;
+      audioOffsetUs += clipAdvanceUs;
 
       opts.onProgress((ci + 1) / probes.length);
       await yieldToEventLoop();
@@ -848,11 +880,23 @@ If you want to offset all timestamps of a track such that the first one is zero,
       let feedingDone = false;
       let settled = false;
       let maxEndUs = offsetUs;
+      // Each decoded frame's follow-up work (waiting for encoder backpressure, drawing to
+      // canvas, calling encoder.encode()) used to run as an independent "fire and forget"
+      // async IIFE per frame. Because waitForEncodeRoom's wait time varies frame to frame
+      // (it depends on when the encoder happens to dequeue something), a LATER frame could
+      // finish its wait and call encoder.encode() before an EARLIER frame that was still
+      // waiting - i.e. frames could reach the encoder out of order. mp4-muxer enforces
+      // strictly increasing timestamps per track and throws when that happens ("Timestamps
+      // must be monotonically increasing"), intermittently failing merges. Chaining each
+      // frame's processing onto the previous one's promise keeps decode-side concurrency
+      // (the decoder can keep decoding ahead) while guaranteeing encoder.encode() calls are
+      // always issued in decode order.
+      let chain = Promise.resolve();
 
       const decoder = new VideoDecoder({
         output: function (frame) {
           pendingOutputs++;
-          (async function () {
+          chain = chain.then(async function () {
             try {
               await waitForEncodeRoom(encoder, 8);
               const outTsUs = offsetUs + frame.timestamp;
@@ -869,7 +913,7 @@ If you want to offset all timestamps of a track such that the first one is zero,
               pendingOutputs--;
               maybeFinish();
             }
-          })();
+          });
         },
         error: function (e) { if (!settled) { settled = true; reject(e); } }
       });
@@ -992,11 +1036,17 @@ If you want to offset all timestamps of a track such that the first one is zero,
     return new Promise(function (resolve, reject) {
       const a = p.audio;
       let pendingOutputs = 0, feedingDone = false, settled = false, maxEndUs = offsetUs;
+      // See the identical comment in decodeAndReencodeVideoClip: chaining each decoded
+      // AudioData's follow-up (backpressure wait + resample + encoder.encode()) onto the
+      // previous one's promise prevents out-of-order encoder.encode() calls when
+      // waitForEncodeRoom's wait time varies between outputs, which otherwise intermittently
+      // triggers mp4-muxer's "Timestamps must be monotonically increasing" error.
+      let chain = Promise.resolve();
 
       const decoder = new AudioDecoder({
         output: function (audioData) {
           pendingOutputs++;
-          (async function () {
+          chain = chain.then(async function () {
             try {
               await waitForEncodeRoom(encoder, 30);
               const result = resampleAndEncode(audioData, targetSampleRate, targetChannels, encoder);
@@ -1008,7 +1058,7 @@ If you want to offset all timestamps of a track such that the first one is zero,
               pendingOutputs--;
               maybeFinish();
             }
-          })();
+          });
         },
         error: function (e) { if (!settled) { settled = true; reject(e); } }
       });
@@ -1131,21 +1181,45 @@ If you want to offset all timestamps of a track such that the first one is zero,
       opts.checkCancel();
       const p = probes[ci];
 
-      if (hasAnyVideo) {
-        if (p.video) {
-          videoOffsetUs = await decodeAndReencodeVideoClip(p, videoEncoder, ctx, targetSize, videoOffsetUs);
-        } else {
-          videoOffsetUs += Math.round((p.durationSec || 0) * 1e6);
+      if (hasAnyVideo && p.video) {
+        await decodeAndReencodeVideoClip(p, videoEncoder, ctx, targetSize, videoOffsetUs);
+      }
+      if (hasAnyAudio && p.audio) {
+        await decodeAndReencodeAudioClip(p, audioEncoder, targetAudioSampleRate, targetAudioChannels, audioOffsetUs);
+        // AudioEncoder is a single instance reused across every clip, and audio codecs
+        // (Opus/AAC) buffer PCM as one continuous stream - unlike the video encoder (one
+        // frame in, one timestamped chunk out), they do NOT respect a gap between separate
+        // encode() calls just because the AudioData we pass has a later `timestamp`. If a
+        // clip's actual audio content is shorter than its video (p.durationSec - extremely
+        // common, since encoders rarely produce byte-identical track lengths), the encoder
+        // silently packs the next clip's audio right up against this one's, discarding the
+        // intended gap entirely. That collapse is exactly what was causing the reported
+        // drift ("音声がまあまあズレてました"): the offset-based fix above corrects the
+        // *intended* timestamps, but without real silence samples filling the gap, the
+        // encoder's continuous internal stream never actually contains that gap. So encode
+        // genuine silence for the leftover gap, anchored right after this clip's real audio.
+        const lastA = p.audioSamples[p.audioSamples.length - 1];
+        const audioContentDurationSec = lastA ? (lastA.cts + lastA.duration) / p.audio.timescale : 0;
+        const gapSec = (p.durationSec || 0) - audioContentDurationSec;
+        if (gapSec > 0.0005) {
+          const gapStartUs = audioOffsetUs + Math.round(audioContentDurationSec * 1e6);
+          await encodeSilence(audioEncoder, gapSec, targetAudioSampleRate, targetAudioChannels, gapStartUs);
         }
+      } else if (hasAnyAudio) {
+        await encodeSilence(audioEncoder, p.durationSec || 0, targetAudioSampleRate, targetAudioChannels, audioOffsetUs);
       }
 
-      if (hasAnyAudio) {
-        if (p.audio) {
-          audioOffsetUs = await decodeAndReencodeAudioClip(p, audioEncoder, targetAudioSampleRate, targetAudioChannels, audioOffsetUs);
-        } else {
-          audioOffsetUs = await encodeSilence(audioEncoder, p.durationSec || 0, targetAudioSampleRate, targetAudioChannels, audioOffsetUs);
-        }
-      }
+      // Advance BOTH tracks' offsets by the SAME per-clip amount (p.durationSec, the clip's
+      // overall duration) rather than by each track's own independently-measured decoded
+      // duration. The two decode/encode helpers used to return their own measured end
+      // timestamp and that became the next clip's starting offset for that track only -
+      // whenever a clip's video and audio content lengths differed even slightly (routine
+      // encoder padding/rounding), the two timelines would drift further apart with every
+      // additional clip. Anchoring both to the same nominal per-clip duration keeps them
+      // permanently locked together, matching the fix applied to the fast (no re-encode) path.
+      const clipAdvanceUs = Math.round((p.durationSec || 0) * 1e6);
+      if (hasAnyVideo) videoOffsetUs += clipAdvanceUs;
+      if (hasAnyAudio) audioOffsetUs += clipAdvanceUs;
 
       processedDurationSec += (p.durationSec || 0);
       opts.onProgress(Math.min(1, processedDurationSec / totalInputDurationSec));
@@ -1227,7 +1301,7 @@ If you want to offset all timestamps of a track such that the first one is zero,
 (function () {
   'use strict';
 
-  var CONFIG = { VERSION: 'v2026-09-07 21:05' };
+  var CONFIG = { VERSION: 'v2026-09-07 23:43' };
 
   // ---------------------------------------------------------------------
   // state & dom refs
